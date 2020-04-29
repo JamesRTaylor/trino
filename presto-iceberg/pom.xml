@@ -2,6 +2,14 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <repositories>
+        <repository>
+            <id>stagedIceberg</id>
+            <name>stagedIceberg</name>
+            <url>https://repository.apache.org/content/repositories/orgapacheiceberg-1005/</url>
+        </repository>
+    </repositories>
+
     <parent>
         <groupId>io.prestosql</groupId>
         <artifactId>presto-root</artifactId>
@@ -14,7 +22,7 @@
 
     <properties>
         <air.main.basedir>${project.parent.basedir}</air.main.basedir>
-        <dep.iceberg.version>0.7.0-incubating</dep.iceberg.version>
+        <dep.iceberg.version>0.8.0-incubating</dep.iceberg.version>
     </properties>
 
     <dependencies>
