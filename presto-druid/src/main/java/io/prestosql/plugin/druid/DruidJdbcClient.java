@@ -14,11 +14,14 @@
 package io.prestosql.plugin.druid;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import io.prestosql.plugin.druid.aggregate.SingleInputAggregateFunction;
 import io.prestosql.plugin.jdbc.BaseJdbcClient;
 import io.prestosql.plugin.jdbc.BaseJdbcConfig;
 import io.prestosql.plugin.jdbc.ColumnMapping;
 import io.prestosql.plugin.jdbc.ConnectionFactory;
 import io.prestosql.plugin.jdbc.JdbcColumnHandle;
+import io.prestosql.plugin.jdbc.JdbcExpression;
 import io.prestosql.plugin.jdbc.JdbcIdentity;
 import io.prestosql.plugin.jdbc.JdbcOutputTableHandle;
 import io.prestosql.plugin.jdbc.JdbcSplit;
@@ -26,10 +29,18 @@ import io.prestosql.plugin.jdbc.JdbcTableHandle;
 import io.prestosql.plugin.jdbc.JdbcTypeHandle;
 import io.prestosql.plugin.jdbc.QueryBuilder;
 import io.prestosql.plugin.jdbc.RemoteTableName;
+import io.prestosql.plugin.jdbc.expression.AggregateFunctionRewriter;
+import io.prestosql.plugin.jdbc.expression.AggregateFunctionRule;
+import io.prestosql.plugin.jdbc.expression.ImplementCount;
+import io.prestosql.plugin.jdbc.expression.ImplementCountAll;
 import io.prestosql.spi.PrestoException;
+import io.prestosql.spi.connector.AggregateFunction;
+import io.prestosql.spi.connector.ColumnHandle;
 import io.prestosql.spi.connector.ConnectorSession;
 import io.prestosql.spi.connector.ConnectorTableMetadata;
 import io.prestosql.spi.connector.SchemaTableName;
+import io.prestosql.spi.type.TimestampType;
+import io.prestosql.spi.type.Type;
 import io.prestosql.spi.type.VarcharType;
 
 import javax.inject.Inject;
@@ -43,8 +54,10 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
@@ -52,6 +65,10 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.prestosql.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
 import static io.prestosql.plugin.jdbc.StandardColumnMappings.varcharColumnMapping;
+import static io.prestosql.spi.type.BigintType.BIGINT;
+import static io.prestosql.spi.type.DoubleType.DOUBLE;
+import static io.prestosql.spi.type.RealType.REAL;
+import static io.prestosql.spi.type.VarcharType.VARCHAR;
 import static io.prestosql.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.prestosql.spi.type.VarcharType.createVarcharType;
 
@@ -64,11 +81,16 @@ public class DruidJdbcClient
     private static final String DRUID_CATALOG = "druid";
     // All the datasources in Druid are created under schema "druid"
     public static final String DRUID_SCHEMA = "druid";
+    private AggregateFunctionRewriter aggregateFunctionRewriter;
 
     @Inject
     public DruidJdbcClient(BaseJdbcConfig config, ConnectionFactory connectionFactory)
     {
         super(config, "\"", connectionFactory);
+
+        this.aggregateFunctionRewriter = new AggregateFunctionRewriter(
+                this::quoted,
+                aggregateFunctionRules());
     }
 
     @Override
@@ -145,6 +167,12 @@ public class DruidJdbcClient
                 return Optional.of(varcharColumnMapping(createVarcharType(columnSize)));
         }
         return super.toPrestoType(session, connection, typeHandle);
+    }
+
+    @Override
+    public Optional<JdbcExpression> implementAggregation(ConnectorSession session, AggregateFunction aggregate, Map<String, ColumnHandle> assignments)
+    {
+        return aggregateFunctionRewriter.rewrite(session, aggregate, assignments);
     }
 
     // Druid doesn't like table names to be qualified with catalog names in the SQL query.
@@ -263,5 +291,97 @@ public class DruidJdbcClient
     public void dropSchema(JdbcIdentity identity, String schemaName)
     {
         throw new PrestoException(DruidErrorCode.DRUID_DDL_NOT_SUPPORTED, "DDL operations are not supported in the presto-druid connector");
+    }
+
+    private Set<AggregateFunctionRule> aggregateFunctionRules()
+    {
+        JdbcTypeHandle bigIntHandle = new JdbcTypeHandle(Types.BIGINT, Optional.of("bigint"), 0, 0, Optional.empty(), Optional.empty());
+        JdbcTypeHandle doubleHandle = new JdbcTypeHandle(Types.DOUBLE, Optional.of("double"), 0, 0, Optional.empty(), Optional.empty());
+        Set<Type> numericTypes = Set.of(DOUBLE, BIGINT, REAL);
+        Set<Type> numericAndTimeStampType = Set.of(DOUBLE, BIGINT, REAL, TimestampType.createTimestampType(3));
+        Set<Type> allTypes = Set.of(DOUBLE, BIGINT, REAL, TimestampType.createTimestampType(3), VARCHAR);
+        ImmutableSet.Builder<AggregateFunctionRule> builder = ImmutableSet.<AggregateFunctionRule>builder()
+                .add(new ImplementCountAll(bigIntHandle))
+                .add(new ImplementCount(bigIntHandle));
+
+        allTypes.forEach(type ->
+                builder.add(SingleInputAggregateFunction.builder()
+                        .prestoName("approx_distinct")
+                        .expression("approx_count_distinct(%s)")
+                        .jdbcTypeHandle(bigIntHandle)
+                        .outputType(BIGINT)
+                        .inputTypes(type)
+                        .build()));
+
+        numericAndTimeStampType.forEach(type ->
+                builder.add(
+                        SingleInputAggregateFunction.builder()
+                                .prestoName("max")
+                                .inputTypes(type)
+                                .outputType(type)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("min")
+                                .inputTypes(type)
+                                .outputType(type)
+                                .build()));
+
+        numericTypes.forEach(type ->
+                builder.add(
+                        SingleInputAggregateFunction.builder()
+                                .prestoName("sum")
+                                .inputTypes(type)
+                                .outputType(type)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("avg")
+                                .expression("avg(CAST(%s AS double))")
+                                .inputTypes(type)
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("stddev")
+                                .expression("CASE WHEN COUNT(%s) > 1 THEN STDDEV(%s) ELSE NULL END")
+                                .inputTypes(type)
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("stddev_pop")
+                                .inputTypes(type)
+                                .expression("CASE WHEN COUNT(%s) = 0 THEN NULL WHEN COUNT(%s) = 1 THEN 0.0 ELSE STDDEV_POP(%s) END")
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("stddev_samp")
+                                .inputTypes(type)
+                                .expression("CASE WHEN COUNT(%s) > 1 THEN STDDEV_SAMP(%s) ELSE NULL END")
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("variance")
+                                .inputTypes(type)
+                                .expression("CASE WHEN COUNT(%s) > 1 THEN VARIANCE(%s) ELSE NULL END")
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("var_pop")
+                                .inputTypes(type)
+                                .expression("CASE WHEN COUNT(%s) = 0 THEN NULL WHEN COUNT(%s) = 1 THEN 0.0 ELSE VAR_POP(%s) END")
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build())
+                        .add(SingleInputAggregateFunction.builder()
+                                .prestoName("var_samp")
+                                .inputTypes(type)
+                                .expression("CASE WHEN COUNT(%s) > 1 THEN VAR_SAMP(%s) ELSE NULL END")
+                                .outputType(DOUBLE)
+                                .jdbcTypeHandle(doubleHandle)
+                                .build()));
+        return builder.build();
     }
 }

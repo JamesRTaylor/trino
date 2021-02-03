@@ -13,6 +13,7 @@
  */
 package io.prestosql.plugin.druid;
 
+import com.google.common.collect.ImmutableList;
 import io.prestosql.plugin.jdbc.JdbcIdentity;
 import io.prestosql.plugin.jdbc.JdbcTableHandle;
 import io.prestosql.spi.connector.ConnectorSession;
@@ -25,6 +26,8 @@ import io.prestosql.testing.assertions.Assert;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.Test;
+
+import java.util.Optional;
 
 import static io.prestosql.plugin.druid.DruidQueryRunner.copyAndIngestTpchData;
 import static io.prestosql.spi.type.VarcharType.VARCHAR;
@@ -112,6 +115,12 @@ public class TestDruidIntegrationSmokeTest
             "'1995-01-02' AS customer_druid_dummy_ts " +  // Dummy timestamp for Druid __time column
             "FROM tpch.tiny.customer";
 
+    private static final String SELECT_SINGLE_ROW = "SELECT " +
+            "CAST(1 AS DOUBLE), " +
+            "CAST(1 AS REAL), " +
+            "CAST(1 AS BIGINT), " +
+            "'1995-01-02' AS DUMMY_TS ";
+
     private TestingDruidServer druidServer;
 
     @Override
@@ -120,6 +129,12 @@ public class TestDruidIntegrationSmokeTest
     {
         this.druidServer = new TestingDruidServer();
         QueryRunner runner = DruidQueryRunner.createDruidQueryRunnerTpch(druidServer);
+        copyAndIngestTpchData(runner.execute(SELECT_SINGLE_ROW), this.druidServer, "singlerow");
+
+        // there is no create API for datasource, we just have to ingest and remove the data.
+        copyAndIngestTpchData(runner.execute(SELECT_SINGLE_ROW), this.druidServer, "nodata");
+        this.druidServer.dropAllSegements("nodata");
+
         copyAndIngestTpchData(runner.execute(SELECT_FROM_ORDERS), this.druidServer, ORDERS.getTableName());
         copyAndIngestTpchData(runner.execute(SELECT_FROM_LINEITEM), this.druidServer, LINE_ITEM.getTableName());
         copyAndIngestTpchData(runner.execute(SELECT_FROM_NATION), this.druidServer, NATION.getTableName());
@@ -286,12 +301,86 @@ public class TestDruidIntegrationSmokeTest
         assertThat(query("SELECT name FROM nation WHERE name < 'EEE' LIMIT 5")).isFullyPushedDown();
 
         // with aggregation
-        assertThat(query("SELECT max(regionkey) FROM nation LIMIT 5")).isNotFullyPushedDown(AggregationNode.class); // global aggregation, LIMIT removed TODO https://github.com/prestosql/presto/pull/4313
+        assertThat(query("SELECT max(regionkey) FROM nation LIMIT 5")).isFullyPushedDown();
+        assertThat(query("SELECT regionkey, count(*) FROM nation GROUP BY regionkey LIMIT 5")).isFullyPushedDown();
+        // Aggregate functions like max do not appear to get pushed down, while count does
         assertThat(query("SELECT regionkey, max(name) FROM nation GROUP BY regionkey LIMIT 5")).isNotFullyPushedDown(AggregationNode.class); // TODO https://github.com/prestosql/presto/pull/4313
         assertThat(query("SELECT DISTINCT regionkey FROM nation LIMIT 5")).isFullyPushedDown();
 
         // with filter and aggregation
-        assertThat(query("SELECT regionkey, count(*) FROM nation WHERE nationkey < 5 GROUP BY regionkey LIMIT 3")).isNotFullyPushedDown(AggregationNode.class); // TODO https://github.com/prestosql/presto/pull/4313
-        assertThat(query("SELECT regionkey, count(*) FROM nation WHERE name < 'EGYPT' GROUP BY regionkey LIMIT 3")).isNotFullyPushedDown(AggregationNode.class); // TODO https://github.com/prestosql/presto/pull/4313
+        assertThat(query("SELECT regionkey, count(*) FROM nation WHERE nationkey < 5 GROUP BY regionkey LIMIT 3")).isFullyPushedDown();
+        assertThat(query("SELECT regionkey, count(*) FROM nation WHERE name < 'EGYPT' GROUP BY regionkey LIMIT 3")).isFullyPushedDown();
+    }
+
+    @Test
+    public void testAggregationPushdown()
+    {
+        assertThat(query("SELECT count(*) FROM orders")).isCorrectlyPushedDown();
+
+        // for varchar only count is pushed down
+        assertThat(query("SELECT count(comment) FROM orders")).isCorrectlyPushedDown();
+
+        // for timestamp
+        assertThat(query("SELECT count(__time) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT min(__time) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT max(__time) FROM orders")).isCorrectlyPushedDown();
+
+        // for double
+        assertThat(query("SELECT count(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT min(totalprice) FROM orders group by custkey")).isCorrectlyPushedDown();
+        assertThat(query("SELECT max(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT sum(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT avg(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(totalprice) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(double_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(double_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(double_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(double_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(double_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(double_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(double_col) FROM singlerow")).isCorrectlyPushedDown();
+
+        // for bigint
+        assertThat(query("SELECT count(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT min(shippriority) FROM orders group by custkey")).isCorrectlyPushedDown();
+        assertThat(query("SELECT max(shippriority) FROM orders group by custkey, shippriority")).isCorrectlyPushedDown();
+        assertThat(query("SELECT sum(shippriority) FROM orders where __time > timestamp '1992-01-02 00:00:00' group by custkey, shippriority")).isCorrectlyPushedDown();
+        assertThat(query("SELECT avg(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(shippriority) FROM orders")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(bigint_col) FROM nodata")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_samp(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT stddev_pop(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT variance(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_samp(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+        assertThat(query("SELECT var_pop(bigint_col) FROM singlerow")).isCorrectlyPushedDown();
+
+        //distinct
+        assertThat(query("SELECT distinct shippriority,clerk FROM orders")).isCorrectlyPushedDown();
+
+        assertThat(query("SELECT approx_distinct(custkey) FROM orders")).ordered().isCorrectlyPushedDown(ImmutableList.of(Optional.of(100L)));
+        assertThat(query("SELECT approx_distinct(totalprice) FROM orders")).ordered().isCorrectlyPushedDown(ImmutableList.of(Optional.of(100L)));
+        assertThat(query("SELECT approx_distinct(comment) FROM orders")).ordered().isCorrectlyPushedDown(ImmutableList.of(Optional.of(100L)));
+        assertThat(query("SELECT approx_distinct(__time) FROM orders")).ordered().isCorrectlyPushedDown(ImmutableList.of(Optional.of(100L)));
     }
 }
