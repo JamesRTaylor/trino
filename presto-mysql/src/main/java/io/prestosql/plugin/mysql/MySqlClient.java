@@ -372,6 +372,12 @@ public class MySqlClient
         return true;
     }
 
+    @Override
+    public boolean supportsGroupingSets()
+    {
+        return false;
+    }
+
     private ColumnMapping jsonColumnMapping()
     {
         return ColumnMapping.sliceMapping(

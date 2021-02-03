@@ -15,10 +15,6 @@ package io.prestosql.sql.planner.iterative.rule;
 
 import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
-import io.prestosql.Session;
-import io.prestosql.matching.Capture;
-import io.prestosql.matching.Captures;
-import io.prestosql.matching.Pattern;
 import io.prestosql.metadata.BoundSignature;
 import io.prestosql.metadata.Metadata;
 import io.prestosql.metadata.TableHandle;
@@ -34,6 +30,8 @@ import io.prestosql.sql.planner.LiteralEncoder;
 import io.prestosql.sql.planner.OrderingScheme;
 import io.prestosql.sql.planner.Symbol;
 import io.prestosql.sql.planner.iterative.Rule;
+import io.prestosql.sql.planner.iterative.Rule.Context;
+import io.prestosql.sql.planner.iterative.Rule.Result;
 import io.prestosql.sql.planner.plan.AggregationNode;
 import io.prestosql.sql.planner.plan.Assignments;
 import io.prestosql.sql.planner.plan.PlanNode;
@@ -43,34 +41,21 @@ import io.prestosql.sql.tree.Expression;
 import io.prestosql.sql.tree.SymbolReference;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.IntStream;
 
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
-import static io.prestosql.SystemSessionProperties.isAllowPushdownIntoConnectors;
-import static io.prestosql.matching.Capture.newCapture;
-import static io.prestosql.sql.planner.plan.Patterns.aggregation;
-import static io.prestosql.sql.planner.plan.Patterns.source;
-import static io.prestosql.sql.planner.plan.Patterns.tableScan;
+import static java.util.stream.Collectors.toSet;
 
-public class PushAggregationIntoTableScan
-        implements Rule<AggregationNode>
+class PushAggregationIntoTableScan
 {
-    private static final Capture<TableScanNode> TABLE_SCAN = newCapture();
-
-    private static final Pattern<AggregationNode> PATTERN =
-            aggregation()
-                    // skip arguments that are, for instance, lambda expressions
-                    .matching(PushAggregationIntoTableScan::allArgumentsAreSimpleReferences)
-                    .matching(node -> node.getGroupingSets().getGroupingSetCount() <= 1)
-                    .matching(PushAggregationIntoTableScan::hasNoMasks)
-                    .with(source().matching(tableScan().capturedAs(TABLE_SCAN)));
-
     private final Metadata metadata;
 
     public PushAggregationIntoTableScan(Metadata metadata)
@@ -78,19 +63,7 @@ public class PushAggregationIntoTableScan
         this.metadata = metadata;
     }
 
-    @Override
-    public Pattern<AggregationNode> getPattern()
-    {
-        return PATTERN;
-    }
-
-    @Override
-    public boolean isEnabled(Session session)
-    {
-        return isAllowPushdownIntoConnectors(session);
-    }
-
-    private static boolean allArgumentsAreSimpleReferences(AggregationNode node)
+    static boolean allArgumentsAreSimpleReferences(AggregationNode node)
     {
         return node.getAggregations()
                 .values().stream()
@@ -98,7 +71,7 @@ public class PushAggregationIntoTableScan
                 .allMatch(SymbolReference.class::isInstance);
     }
 
-    private static boolean hasNoMasks(AggregationNode node)
+    static boolean hasNoMasks(AggregationNode node)
     {
         return !node.getAggregations()
                 .values().stream()
@@ -106,10 +79,14 @@ public class PushAggregationIntoTableScan
                 .anyMatch(isMaskPresent -> isMaskPresent);
     }
 
-    @Override
-    public Result apply(AggregationNode node, Captures captures, Context context)
+    public Result apply(
+            AggregationNode node,
+            TableScanNode tableScan,
+            Context context,
+            List<List<Symbol>> groupBySymbols,
+            Map<Symbol, Symbol> groupingSetSymbolMapping)
     {
-        return pushAggregationIntoTableScan(metadata, context, captures.get(TABLE_SCAN), node.getAggregations(), node.getGroupingSets().getGroupingKeys())
+        return pushAggregationIntoTableScan(metadata, context, tableScan, node.getAggregations(), groupBySymbols, groupingSetSymbolMapping, node)
                 .map(Rule.Result::ofPlanNode)
                 .orElseGet(Rule.Result::empty);
     }
@@ -118,28 +95,32 @@ public class PushAggregationIntoTableScan
             Metadata metadata,
             Context context,
             TableScanNode tableScan,
-            Map<Symbol, AggregationNode.Aggregation> aggregations,
-            List<Symbol> groupingKeys)
+            Map<Symbol, AggregationNode.Aggregation> aggregationList,
+            List<List<Symbol>> groupBySymbols,
+            Map<Symbol, Symbol> groupingSetSymbolMapping,
+            PlanNode node)
     {
         Map<String, ColumnHandle> assignments = tableScan.getAssignments()
                 .entrySet().stream()
                 .collect(toImmutableMap(entry -> entry.getKey().getName(), Entry::getValue));
 
-        List<Entry<Symbol, AggregationNode.Aggregation>> aggregationsList = aggregations
+        List<Entry<Symbol, AggregationNode.Aggregation>> aggregations = aggregationList
                 .entrySet().stream()
                 .collect(toImmutableList());
 
-        List<AggregateFunction> aggregateFunctions = aggregationsList.stream()
+        List<AggregateFunction> aggregateFunctions = aggregations.stream()
                 .map(Entry::getValue)
                 .map(aggregation -> toAggregateFunction(context, aggregation))
                 .collect(toImmutableList());
 
-        List<Symbol> aggregationOutputSymbols = aggregationsList.stream()
+        List<Symbol> aggregationOutputSymbols = aggregations.stream()
                 .map(Entry::getKey)
                 .collect(toImmutableList());
 
-        List<ColumnHandle> groupByColumns = groupingKeys.stream()
-                .map(groupByColumn -> assignments.get(groupByColumn.getName()))
+        List<List<ColumnHandle>> groupByColumns = groupBySymbols.stream()
+                .map(groupingSetColumns -> groupingSetColumns.stream()
+                        .map(groupByColumn -> assignments.get(groupByColumn.getName()))
+                        .collect(toImmutableList()))
                 .collect(toImmutableList());
 
         Optional<AggregationApplicationResult<TableHandle>> aggregationPushdownResult = metadata.applyAggregation(
@@ -147,7 +128,7 @@ public class PushAggregationIntoTableScan
                 tableScan.getTable(),
                 aggregateFunctions,
                 assignments,
-                ImmutableList.of(groupByColumns));
+                groupByColumns);
 
         if (aggregationPushdownResult.isEmpty()) {
             return Optional.empty();
@@ -179,20 +160,37 @@ public class PushAggregationIntoTableScan
         verify(aggregationOutputSymbols.size() == newProjections.size());
 
         Assignments.Builder assignmentBuilder = Assignments.builder();
+        Set<Symbol> newOutputSymbols = new HashSet<>();
         IntStream.range(0, aggregationOutputSymbols.size())
-                .forEach(index -> assignmentBuilder.put(aggregationOutputSymbols.get(index), newProjections.get(index)));
+                .forEach(index -> {
+                    Symbol symbol = aggregationOutputSymbols.get(index);
+                    newOutputSymbols.add(symbol);
+                    assignmentBuilder.put(symbol, newProjections.get(index));
+                });
 
         ImmutableBiMap<Symbol, ColumnHandle> scanAssignments = newScanAssignments.build();
         ImmutableBiMap<ColumnHandle, Symbol> columnHandleToSymbol = scanAssignments.inverse();
         // projections assignmentBuilder should have both agg and group by so we add all the group bys as symbol references
-        groupingKeys
-                .forEach(groupBySymbol -> {
-                    // if the connector returned a new mapping from oldColumnHandle to newColumnHandle, groupBy needs to point to
-                    // new columnHandle's symbol reference, otherwise it will continue pointing at oldColumnHandle.
-                    ColumnHandle originalColumnHandle = assignments.get(groupBySymbol.getName());
-                    ColumnHandle groupByColumnHandle = result.getGroupingColumnMapping().getOrDefault(originalColumnHandle, originalColumnHandle);
-                    assignmentBuilder.put(groupBySymbol, columnHandleToSymbol.get(groupByColumnHandle).toSymbolReference());
-                });
+        groupingSetSymbolMapping.forEach((key, value) -> {
+            // if the connector returned a new mapping from oldColumnHandle to newColumnHandle, groupBy needs to point to
+            // new columnHandle's symbol reference, otherwise it will continue pointing at oldColumnHandle.
+            ColumnHandle originalColumnHandle = assignments.get(value.getName());
+            ColumnHandle groupByColumnHandle = result.getGroupingColumnMapping().getOrDefault(originalColumnHandle, originalColumnHandle);
+
+            newOutputSymbols.add(key);
+            assignmentBuilder.put(key, columnHandleToSymbol.get(groupByColumnHandle).toSymbolReference());
+        });
+
+        Set<Symbol> missingSymbols = node.getOutputSymbols().stream()
+                .filter(symbol -> !newOutputSymbols.contains(symbol))
+                .collect(toSet());
+
+        // The only missing symbols should all be groupId symbols that should be pruned as they will be unused
+        // but we still need to return them to keep the output symbols same as before.
+        // This check fails when called from PushDistinctLimit, so commenting it out. JT
+        // verify(missingSymbols.stream().allMatch(symbol -> symbol.getName().toLowerCase(Locale.ENGLISH).startsWith("groupid")));
+
+        missingSymbols.forEach(symbol -> assignmentBuilder.put(symbol, symbol.toSymbolReference()));
 
         return Optional.of(
                 new ProjectNode(

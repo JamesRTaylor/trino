@@ -13,6 +13,7 @@
  */
 package io.prestosql.sql.planner.iterative.rule;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.prestosql.Session;
 import io.prestosql.matching.Capture;
@@ -71,7 +72,9 @@ public class PushDistinctLimitIntoTableScan
                 context,
                 captures.get(TABLE_SCAN),
                 ImmutableMap.of(),
-                node.getDistinctSymbols());
+                ImmutableList.of(node.getDistinctSymbols()),
+                ImmutableMap.of(),
+                node);
 
         if (result.isEmpty()) {
             return Result.empty();
