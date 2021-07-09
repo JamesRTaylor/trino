@@ -252,7 +252,7 @@ public class ParquetReader
         currentGroupRowCount = currentBlockMetadata.getRowCount();
         if (filter != null && options.isUseColumnIndex()) {
             if (columnIndexStore.get(currentRowGroup).isPresent()) {
-                currentGroupRowRanges = getRowRanges(currentRowGroup);
+                currentGroupRowRanges = getRowRanges(filter, currentRowGroup);
                 long rowCount = currentGroupRowRanges.rowCount();
                 if (rowCount == 0) {
                     return false;
@@ -341,7 +341,7 @@ public class ParquetReader
     private FilteredOffsetIndex getFilteredOffsetIndex(int rowGroup, long rowGroupRowCount, ColumnPath columnPath)
     {
         if (filter != null) {
-            RowRanges rowRanges = getRowRanges(rowGroup);
+            RowRanges rowRanges = getRowRanges(filter, rowGroup);
             if (rowRanges != null && rowRanges.rowCount() < rowGroupRowCount) {
                 Optional<ColumnIndexStore> columnIndexStore = this.columnIndexStore.get(rowGroup);
                 if (columnIndexStore.isPresent()) {
@@ -381,7 +381,7 @@ public class ParquetReader
         return columnChunk;
     }
 
-    protected PageReader createPageReader(List<Slice> slices, ColumnChunkMetaData metadata, ColumnDescriptor columnDescriptor, OffsetIndex offsetIndex)
+    private PageReader createPageReader(List<Slice> slices, ColumnChunkMetaData metadata, ColumnDescriptor columnDescriptor, OffsetIndex offsetIndex)
             throws IOException
     {
         ColumnChunkDescriptor descriptor = new ColumnChunkDescriptor(columnDescriptor, metadata);
@@ -389,7 +389,7 @@ public class ParquetReader
         return columnChunk.readAllPages();
     }
 
-    protected List<Slice> allocateBlock(int fieldId)
+    private List<Slice> allocateBlock(int fieldId)
     {
         Collection<ChunkReader> readers = chunkReaders.get(new ChunkKey(fieldId, currentRowGroup));
         List<Slice> slices = Lists.newArrayListWithExpectedSize(readers.size());
@@ -459,10 +459,12 @@ public class ParquetReader
 
     private static <T> List<T> listWithNulls(int size)
     {
-        return Stream.generate(() -> (T) null).limit(size).collect(Collectors.toCollection(ArrayList<T>::new));
+        return Stream.generate(() -> (T) null)
+                .limit(size)
+                .collect(Collectors.toCollection(ArrayList<T>::new));
     }
 
-    private RowRanges getRowRanges(int blockIndex)
+    private RowRanges getRowRanges(FilterPredicate filter, int blockIndex)
     {
         requireNonNull(filter, "filter is null");
 

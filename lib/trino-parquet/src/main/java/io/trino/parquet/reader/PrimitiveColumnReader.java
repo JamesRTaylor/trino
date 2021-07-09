@@ -42,7 +42,6 @@ import org.joda.time.DateTimeZone;
 import java.io.IOException;
 import java.util.Optional;
 import java.util.OptionalLong;
-import java.util.function.Consumer;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Verify.verify;
@@ -73,7 +72,7 @@ public abstract class PrimitiveColumnReader
     private DataPage page;
     private int remainingValueCountInPage;
     private int readOffset;
-    private PeekingIterator<Long> indexIter;
+    private PeekingIterator<Long> indexIterator;
     private long currentRow;
     private long targetRow;
 
@@ -130,7 +129,7 @@ public abstract class PrimitiveColumnReader
         this.columnDescriptor = requireNonNull(columnDescriptor, "columnDescriptor");
         pageReader = null;
         this.targetRow = 0;
-        this.indexIter = null;
+        this.indexIterator = null;
     }
 
     public PageReader getPageReader()
@@ -156,7 +155,7 @@ public abstract class PrimitiveColumnReader
         }
         checkArgument(pageReader.getTotalValueCount() > 0, "page is empty");
         totalValueCount = pageReader.getTotalValueCount();
-        indexIter = (rowRanges == null) ? null : Iterators.peekingIterator(rowRanges.iterator());
+        indexIterator = (rowRanges == null) ? null : Iterators.peekingIterator(rowRanges.iterator());
     }
 
     public void prepareNextRead(int batchSize)
@@ -192,7 +191,7 @@ public abstract class PrimitiveColumnReader
 
     private void readValues(BlockBuilder blockBuilder, int valuesToRead, Type type, IntList definitionLevels, IntList repetitionLevels)
     {
-        if (indexIter == null) {
+        if (indexIterator == null) {
             processValues(valuesToRead, () -> {
                 readValue(blockBuilder, type);
                 definitionLevels.add(definitionLevel);
@@ -200,7 +199,7 @@ public abstract class PrimitiveColumnReader
             });
         }
         else {
-            processValuesSync(valuesToRead, ignored -> {
+            processValuesSync(valuesToRead, () -> {
                 readValue(blockBuilder, type);
                 definitionLevels.add(definitionLevel);
                 repetitionLevels.add(repetitionLevel);
@@ -272,7 +271,7 @@ public abstract class PrimitiveColumnReader
      * values (and the related rl and dl) for the rows [20, 39] in the end of the page 0 for col2. Similarly, we have to
      * skip values while reading page0 and page1 for col3.
      */
-    private void processValuesSync(int valuesToRead, Consumer<Void> valueConsumer)
+    private void processValuesSync(int valuesToRead, Runnable valueReader)
     {
         if (definitionLevel == EMPTY_LEVEL_VALUE && repetitionLevel == EMPTY_LEVEL_VALUE) {
             definitionLevel = definitionReader.readLevel();
@@ -288,7 +287,7 @@ public abstract class PrimitiveColumnReader
                     skipCount++;
                 }
                 else {
-                    valueConsumer.accept(null);
+                    valueReader.run();
                     valueCount++;
                     consumed = true;
                 }
@@ -307,7 +306,6 @@ public abstract class PrimitiveColumnReader
             }
             while (repetitionLevel != 0);
 
-            // TODO: We could created infinite loop
             if (consumed) {
                 i++;
             }
@@ -326,7 +324,7 @@ public abstract class PrimitiveColumnReader
         while (valuePosition < readOffset) {
             if (page == null) {
                 readNextPage();
-                if (indexIter != null && indexIter.hasNext()) {
+                if (indexIterator != null && indexIterator.hasNext()) {
                     long skipRows = targetRow - currentRow;
                     while (skipRows > 0) {
                         skipRows -= skipValues((int) skipRows);
@@ -419,7 +417,7 @@ public abstract class PrimitiveColumnReader
             valuesReader.initFromPage(valueCount, in);
             if (firstRowIndex.isPresent()) {
                 currentRow = firstRowIndex.getAsLong();
-                targetRow = indexIter.hasNext() ? indexIter.peek() : Long.MAX_VALUE;
+                targetRow = indexIterator.hasNext() ? indexIterator.peek() : Long.MAX_VALUE;
             }
             return valuesReader;
         }
@@ -428,17 +426,20 @@ public abstract class PrimitiveColumnReader
         }
     }
 
-    private boolean nextRow(int rl)
+    // Move to next row returning true if currentRow is still less than the targetRow
+    private boolean nextRow(int repetitionLevel)
     {
-        if (indexIter == null) {
+        if (indexIterator == null) {
             return false;
         }
 
-        if (rl == 0) {
+        if (repetitionLevel == 0) {
             if (currentRow > targetRow) {
-                targetRow = indexIter.hasNext() ? indexIter.next() : Long.MAX_VALUE;
+                targetRow = indexIterator.hasNext() ? indexIterator.next() : Long.MAX_VALUE;
             }
-            return currentRow++ < targetRow;
+            boolean isBeforeTargetRow = currentRow < targetRow;
+            currentRow++;
+            return isBeforeTargetRow;
         }
 
         return currentRow < targetRow;

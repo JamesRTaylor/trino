@@ -89,11 +89,9 @@ public class TupleDomainParquetPredicate
         if (numberOfRows == 0) {
             return false;
         }
-
         if (effectivePredicate.isNone()) {
             return false;
         }
-
         Map<ColumnDescriptor, Domain> effectivePredicateDomains = effectivePredicate.getDomains()
                 .orElseThrow(() -> new IllegalStateException("Effective predicate other than none should have domains"));
 
